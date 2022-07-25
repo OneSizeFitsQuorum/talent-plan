@@ -1,6 +1,8 @@
 use futures::executor::block_on;
-use labrpc::Error::Timeout;
+use futures::future::err;
+use labrpc::Error::{Other, Timeout};
 use labrpc::*;
+use std::collections::HashMap;
 use std::{thread, time};
 
 use crate::msg::{self, TimestampRequest};
@@ -25,6 +27,8 @@ pub struct Client {
     // Your definitions here.
     tso_client: TSOClient,
     txn_client: TransactionClient,
+    start_ts: u64,
+    mem_buffer: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl Client {
@@ -34,6 +38,8 @@ impl Client {
         Client {
             tso_client,
             txn_client,
+            start_ts: 0,
+            mem_buffer: HashMap::new(),
         }
     }
 
@@ -46,12 +52,15 @@ impl Client {
                     .get_timestamp(&msg::TimestampRequest {})
                     .await
             }) {
-                Ok(response) => return Ok(0),
+                Ok(response) => return Ok(response.timestamp),
                 Err(error) => {
                     warn!("get_timestamp request failed because {}", error);
-                    thread::sleep(time::Duration::from_millis(
-                        ((1 << i) * BACKOFF_TIME_MS) as u64,
-                    ));
+                    match error {
+                        Timeout => thread::sleep(time::Duration::from_millis(
+                            ((1 << i) * BACKOFF_TIME_MS) as u64,
+                        )),
+                        other => return Err(other),
+                    }
                 }
             };
         }
@@ -61,24 +70,147 @@ impl Client {
     /// Begins a new transaction.
     pub fn begin(&mut self) {
         // Your code here.
-        unimplemented!()
+        self.start_ts = self
+            .get_timestamp()
+            .expect("Unexpected error occurs when get_timestamp");
+        info!("begin with start_ts {}", self.start_ts);
     }
 
     /// Gets the value for a given key.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
         // Your code here.
-        unimplemented!()
+        let get_request = msg::GetRequest {
+            key,
+            start_ts: self.start_ts,
+        };
+        for i in 0..RETRY_TIMES {
+            match block_on(async { self.txn_client.get(&get_request).await }) {
+                Ok(response) => return Ok(response.value),
+                Err(error) => {
+                    warn!("get request failed because {}", error);
+                    match error {
+                        Timeout => thread::sleep(time::Duration::from_millis(
+                            ((1 << i) * BACKOFF_TIME_MS) as u64,
+                        )),
+                        other => return Err(other),
+                    }
+                }
+            };
+        }
+        Err(Timeout)
     }
 
     /// Sets keys in a buffer until commit time.
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
         // Your code here.
-        unimplemented!()
+        self.mem_buffer.insert(key, value);
+    }
+
+    fn inner_prewrite(
+        &self,
+        start_ts: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        primary: Vec<u8>,
+    ) -> Result<bool> {
+        let pre_write_request = msg::PrewriteRequest {
+            start_ts,
+            primary,
+            key,
+            value,
+        };
+        for i in 0..RETRY_TIMES {
+            match block_on(async { self.txn_client.prewrite(&pre_write_request).await }) {
+                Ok(response) => return Ok(response.success),
+                Err(error) => {
+                    warn!("prewrite request failed because {}", error);
+                    match error {
+                        Timeout => thread::sleep(time::Duration::from_millis(
+                            ((1 << i) * BACKOFF_TIME_MS) as u64,
+                        )),
+                        other => return Err(other),
+                    }
+                }
+            };
+        }
+        Err(Timeout)
+    }
+
+    fn inner_commit(
+        &self,
+        is_primary: bool,
+        start_ts: u64,
+        commit_ts: u64,
+        key: Vec<u8>,
+    ) -> Result<bool> {
+        let commit_request = msg::CommitRequest {
+            is_primary,
+            start_ts,
+            commit_ts,
+            key,
+        };
+        for i in 0..RETRY_TIMES {
+            match block_on(async { self.txn_client.commit(&commit_request).await }) {
+                Ok(response) => return Ok(response.success),
+                Err(error) => {
+                    warn!("commit request failed because {}", error);
+                    match error {
+                        Timeout => thread::sleep(time::Duration::from_millis(
+                            ((1 << i) * BACKOFF_TIME_MS) as u64,
+                        )),
+                        other => return Err(other),
+                    }
+                }
+            };
+        }
+        Err(Timeout)
     }
 
     /// Commits a transaction.
     pub fn commit(&self) -> Result<bool> {
-        // Your code here.
-        unimplemented!()
+        if self.mem_buffer.is_empty() {
+            return Ok(true);
+        }
+
+        let start_ts = self.start_ts;
+        let mutations: Vec<(&Vec<u8>, &Vec<u8>)> = self.mem_buffer.iter().collect();
+
+        let primary = &mutations[0];
+        let secondaries = &mutations[1..];
+
+        if !self.inner_prewrite(
+            start_ts,
+            primary.0.to_vec(),
+            primary.1.to_vec(),
+            primary.0.to_vec(),
+        )? {
+            return Ok(false);
+        }
+
+        for secondary in secondaries {
+            if !self.inner_prewrite(
+                start_ts,
+                secondary.0.to_vec(),
+                secondary.1.to_vec(),
+                primary.0.to_vec(),
+            )? {
+                return Ok(false);
+            }
+        }
+        let commit_ts = self.get_timestamp()?;
+        info!(
+            "commit with start_ts {}, commit_ts {}",
+            self.start_ts, commit_ts
+        );
+
+        if !self.inner_commit(true, start_ts, commit_ts, primary.0.to_vec())? {
+            return Ok(false);
+        }
+
+        for secondary in secondaries {
+            let _ = self.inner_commit(false, start_ts, commit_ts, secondary.0.to_vec());
+        }
+
+        Ok(true)
     }
 }
