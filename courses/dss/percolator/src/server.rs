@@ -87,6 +87,21 @@ impl KvTable {
         .last()
     }
 
+    #[inline]
+    fn contains_in_write_column(&self, primary: Vec<u8>, start_ts: u64) -> Option<u64> {
+        // Your code here.
+        for (key, value) in self.write.range((
+            Included((primary.clone(), 0)),
+            Included((primary, u64::MAX)),
+        )) {
+            match value {
+                Value::Timestamp(time) if *time == start_ts => return Some(*time),
+                _ => continue,
+            }
+        }
+        None
+    }
+
     // Writes a record to a specified column in MemoryStorage.
     #[inline]
     fn write(&mut self, key: Vec<u8>, column: Column, ts: u64, value: Value) {
@@ -101,14 +116,14 @@ impl KvTable {
 
     #[inline]
     // Erases a record from a specified column in MemoryStorage.
-    fn erase(&mut self, key: Vec<u8>, column: Column, commit_ts: u64) {
+    fn erase(&mut self, key: Vec<u8>, column: Column, start_ts: u64) {
         // Your code here.
         let mut map = match column {
             Column::Write => &mut self.write,
             Column::Data => &mut self.data,
             Column::Lock => &mut self.lock,
         };
-        map.remove(&(key, commit_ts));
+        map.remove(&(key, start_ts));
     }
 }
 
@@ -130,6 +145,7 @@ impl transaction::Service for MemoryStorage {
                 .read(req.key.clone(), Column::Lock, None, Some(req.start_ts))
                 .is_some()
             {
+                drop(kv);
                 self.back_off_maybe_clean_up_lock(req.start_ts, req.key.clone());
                 continue;
             }
@@ -139,19 +155,21 @@ impl transaction::Service for MemoryStorage {
             }
             if let Value::Timestamp(data_ts) = latest_write.unwrap().1 {
                 if let Value::Vector(result) = kv
-                    .read(
-                        req.key.clone(),
-                        Column::Data,
-                        Some(*data_ts),
-                        Some(*data_ts),
-                    )
+                    .read(req.key, Column::Data, Some(*data_ts), Some(*data_ts))
                     .unwrap()
                     .1
                 {
                     return Ok(GetResponse {
                         value: result.to_vec(),
                     });
+                } else {
+                    panic!("Could not find the corresponding value")
                 }
+            } else {
+                panic!(
+                    "Unexpected value {:?} in write column",
+                    latest_write.unwrap().1
+                )
             }
         }
     }
@@ -240,8 +258,37 @@ impl transaction::Service for MemoryStorage {
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
         // Your code here.
-        thread::sleep(time::Duration::from_millis(TTL));
-        // let kv = self.data.lock().unwrap();
-        // if let Some(entry) = kv.read(key, Column::Lock, None, Some(start_ts)) {}
+        thread::sleep(Duration::from_nanos(TTL));
+        let mut kv = self.data.lock().unwrap();
+        if let Some(entry) = kv.read(key.clone(), Column::Lock, None, Some(start_ts)) {
+            let ts = entry.0 .1;
+            if let Value::Vector(primary) = entry.1 {
+                match kv.contains_in_write_column(primary.clone(), ts) {
+                    None => {
+                        info!(
+                            "Recovery rollback tx: erase key=({:?}, {}) in Column {:?}",
+                            key,
+                            ts,
+                            Column::Lock
+                        );
+                        kv.erase(key, Column::Lock, ts);
+                    }
+                    Some(commit_ts) => {
+                        info!("erase key=({:?}, {}) in Column {:?}", key, ts, Column::Lock);
+                        kv.erase(key.clone(), Column::Lock, ts);
+                        info!(
+                            "Recovery commit tx: write key=({:?}, {}), value={:?} to Column {:?}",
+                            key,
+                            commit_ts,
+                            Value::Timestamp(ts),
+                            Column::Write
+                        );
+                        kv.write(key, Column::Write, commit_ts, Value::Timestamp(ts));
+                    }
+                }
+            } else {
+                panic!("Unexpected error")
+            }
+        }
     }
 }
