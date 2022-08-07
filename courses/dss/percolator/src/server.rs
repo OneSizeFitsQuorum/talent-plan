@@ -95,7 +95,7 @@ impl KvTable {
             Included((primary, u64::MAX)),
         )) {
             match value {
-                Value::Timestamp(time) if *time == start_ts => return Some(*time),
+                Value::Timestamp(time) if *time == start_ts => return Some(key.1),
                 _ => continue,
             }
         }
